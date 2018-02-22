@@ -3,6 +3,8 @@
 
 import sys
 import rospy
+import re
+import time
 import numpy
 import argparse
 import math
@@ -10,15 +12,19 @@ import underworlds
 import tf2_ros
 from underworlds.helpers.geometry import get_world_transform
 from underworlds.tools.loader import ModelLoader
-from underworlds.helpers.transformations import translation_matrix, quaternion_matrix, euler_matrix
-from multimodal_human_provider.msg import PersonTrackletArray
-from underworlds.types import Camera, Mesh, MESH
+from underworlds.helpers.transformations import translation_matrix, quaternion_matrix, euler_matrix, translation_from_matrix
+from multimodal_human_provider.msg import GazeInfoArray
+from underworlds.types import Camera, Mesh, MESH, Situation
 
 TF_CACHE_TIME = 5.0
 DEFAULT_CLIP_PLANE_NEAR = 0.01
 DEFAULT_CLIP_PLANE_FAR = 1000.0
 DEFAULT_HORIZONTAL_FOV = 50.0
 DEFAULT_ASPECT = 1.33333
+LOOK_AT_THRESHOLD = 0.7
+MIN_NB_DETECTION = 3
+MIN_DIST_DETECTION = 0.2
+MAX_HEIGHT = 2.5
 
 
 # just for convenience
@@ -35,7 +41,7 @@ def transformation_matrix(t, q):
 
 class MultimodalHumanProvider(object):
     def __init__(self, ctx, output_world, mesh_dir, reference_frame):
-        self.ros_subscriber = {"person_tracklet": rospy.Subscriber("/tracklet", PersonTrackletArray, self.callbackPersonTracklet)}
+        self.ros_subscriber = {"gaze": rospy.Subscriber("/wp2/gaze", GazeInfoArray, self.callbackGaze)}
         self.human_cameras_ids = {}
         self.ctx = ctx
         self.human_bodies = {}
@@ -46,8 +52,19 @@ class MultimodalHumanProvider(object):
         self.human_meshes = {}
         self.human_aabb = {}
 
+        self.nb_gaze_detected = {}
+        self.added_human_id = []
+
+        self.detection_time = None
+        self.reco_durations = []
+        self.record_time = False
+
+        self.robot_name = rospy.get_param("robot_name", "pepper")
+
+        self.already_removed_nodes = []
+
         nodes_loaded = []
-        rospy.logwarn(self.mesh_dir + "face.blend")
+
         try:
             nodes_loaded = ModelLoader().load(self.mesh_dir + "face.blend", self.ctx,
                                               world=output_world, root=None, only_meshes=True,
@@ -55,7 +72,6 @@ class MultimodalHumanProvider(object):
         except Exception as e:
             rospy.logwarn("[multimodal_human_provider] Exception occurred with %s : %s" % (self.mesh_dir + "face.blend", str(e)))
 
-        rospy.logwarn(nodes_loaded)
         for n in nodes_loaded:
             if n.type == MESH:
                 self.human_meshes["face"] = n.properties["mesh_ids"]
@@ -97,51 +113,106 @@ class MultimodalHumanProvider(object):
         r = msg.transform.rotation
         return [t.x, t.y, t.z], [r.x, r.y, r.z, r.w]
 
-    def callbackPersonTracklet(self, msg):
+    def callbackGaze(self, msg):
         nodes_to_update = []
 
         if msg.data:
-            for i, tracklet in enumerate(msg.data):
-                human_id = tracklet.tracklet_id
+            for i, gaze in enumerate(msg.data):
+                human_id = gaze.person_id
+                track_id = gaze.track_id
 
-                new_node = self.create_human_pov(human_id)
-                if human_id in self.human_cameras_ids:
-                    new_node.id = self.human_cameras_ids[human_id]
+
+                if human_id not in self.nb_gaze_detected:
+                    self.nb_gaze_detected[human_id] = 0
                 else:
-                    self.human_cameras_ids[human_id] = new_node.id
+                    self.nb_gaze_detected[human_id] += 1
 
-                t = [tracklet.head.position.x, tracklet.head.position.y, tracklet.head.position.z]
-                q = [tracklet.head.orientation.x, tracklet.head.orientation.y, tracklet.head.orientation.z, tracklet.head.orientation.w]
+                if track_id == human_id:
+                    self.detection_time = time.time()
+                    self.record_time = True
+                else:
+                    if self.record_time:
+                        self.reco_durations.append(time.time() - self.detection_time)
+                        self.record_time = False
 
-                (trans, rot) = self.lookupTransform(self.reference_frame, msg.header.frame_id, rospy.Time(0))
+                if gaze.head_gaze_available and self.nb_gaze_detected[human_id] > MIN_NB_DETECTION:
+                    new_node = self.create_human_pov(human_id)
+                    if human_id in self.human_cameras_ids:
+                        new_node.id = self.human_cameras_ids[human_id]
+                    else:
+                        self.human_cameras_ids[human_id] = new_node.id
 
-                offset = euler_matrix(0, math.radians(90), math.radians(90), 'rxyz')
+                    t = [gaze.head_gaze.position.x, gaze.head_gaze.position.y, gaze.head_gaze.position.z]
+                    q = [gaze.head_gaze.orientation.x, gaze.head_gaze.orientation.y, gaze.head_gaze.orientation.z, gaze.head_gaze.orientation.w]
+                    if math.sqrt(t[0]*t[0]+t[1]*t[1]+t[2]*t[2]) < MIN_DIST_DETECTION:
+                        continue
+                    (trans, rot) = self.lookupTransform(self.reference_frame, msg.header.frame_id, rospy.Time(0))
 
-                transform = numpy.dot(transformation_matrix(trans, rot), transformation_matrix(t, q))
+                    offset = euler_matrix(0, math.radians(90), math.radians(90), 'rxyz')
 
-                new_node.transformation = numpy.dot(transform, offset)
+                    transform = numpy.dot(transformation_matrix(trans, rot), transformation_matrix(t, q))
 
-                nodes_to_update.append(new_node)
-
-                if human_id not in self.human_bodies:
-                    self.human_bodies[human_id] = {}
-
-                if "face" not in self.human_bodies[human_id]:
-                    new_node = Mesh(name="human_face-"+str(human_id))
-                    new_node.properties["mesh_ids"] = self.human_meshes["face"]
-                    new_node.properties["aabb"] = self.human_aabb["face"]
-                    new_node.parent = self.human_cameras_ids[human_id]
-                    offset = euler_matrix(math.radians(90), math.radians(0), math.radians(90), 'rxyz')
-                    new_node.transformation = numpy.dot(new_node.transformation, offset)
-                    self.human_bodies[human_id]["face"] = new_node.id
+                    new_node.transformation = numpy.dot(transform, offset)
+                    if translation_from_matrix(new_node.transformation)[2] > MAX_HEIGHT:
+                        continue
+                    self.added_human_id.append(human_id)
                     nodes_to_update.append(new_node)
+
+                    if human_id not in self.human_bodies:
+                        self.human_bodies[human_id] = {}
+
+                    if "face" not in self.human_bodies[human_id]:
+                        new_node = Mesh(name="human_face-"+str(human_id))
+                        new_node.properties["mesh_ids"] = self.human_meshes["face"]
+                        new_node.properties["aabb"] = self.human_aabb["face"]
+                        new_node.parent = self.human_cameras_ids[human_id]
+                        offset = euler_matrix(math.radians(90), math.radians(0), math.radians(90), 'rxyz')
+                        new_node.transformation = numpy.dot(new_node.transformation, offset)
+                        self.human_bodies[human_id]["face"] = new_node.id
+                        nodes_to_update.append(new_node)
+
+                    #if gaze.probability_looking_at_robot >= LOOK_AT_THRESHOLD:
+                    #    self.target.timeline.start(Situation(desc="lookat(human-%s,%s)" % (str(gaze.person_id), self.robot_name)))
 
         if nodes_to_update:
             self.target.scene.nodes.update(nodes_to_update)
-            #rospy.loginfo("[robot_monitor] %s Nodes updated", str(len(nodes_to_update)))
+
+    def clean_humans(self):
+        nodes_to_remove = []
+
+        for node in self.target.scene.nodes:
+            if node not in self.already_removed_nodes:
+                if re.match("human-", node.name):
+                    if time.time() - node.last_update > 5.0:
+                        nodes_to_remove.append(node)
+                        for child in node.children:
+                            nodes_to_remove.append(self.target.scene.nodes[child])
+
+        if nodes_to_remove:
+            rospy.logwarn(nodes_to_remove)
+            self.already_removed_nodes = nodes_to_remove
+            self.target.scene.nodes.remove(nodes_to_remove)
 
     def run(self):
-        rospy.spin()
+        while not rospy.is_shutdown():
+            pass
+        import csv
+        with open("/home/ysallami/stat.csv", "w") as csvfile:
+            fieldnames = ["human_id", "nb_detection", "is_human"]
+            writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+            writer.writeheader()
+            for human_id, nb_detect in self.nb_gaze_detected.items():
+                writer.writerow({"human_id": int(human_id), "nb_detection": int(nb_detect),
+                                 "is_human": 1 if human_id in self.added_human_id else 0})
+            csvfile.close()
+
+        with open("/home/ysallami/duration_stat.csv", "w") as csvfile2:
+            fieldnames = ["reco_durations"]
+            writer = csv.DictWriter(csvfile2, fieldnames=fieldnames)
+            writer.writeheader()
+            for duration in self.reco_durations:
+                writer.writerow({"reco_durations": duration})
+            csvfile2.close()
 
 
 if __name__ == "__main__":
